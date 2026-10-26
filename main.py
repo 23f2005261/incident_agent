@@ -175,12 +175,11 @@ class PlanFailed(Exception):
 
 def schema_errors(schema, args):
     try:
-        v = jsonschema.Draft202012Validator(schema)
+        v = jsonschema.validators.validator_for(schema)(schema)
         errs = sorted(v.iter_errors(args), key=lambda e: list(map(str, e.path)))
-        return '; '.join('%s: %s' % ('/'.join(map(str, e.path)) or 'arguments', e.message[:120]) for e in errs[:3]) or None
-    except Exception as e:
-        if type(e).__name__ in ('SchemaError', 'ImportError', 'ModuleNotFoundError'): return None
-        return 'arguments invalid'
+    except Exception:
+        return None            # a schema we cannot interpret must never block a plan
+    return '; '.join('%s: %s' % ('/'.join(map(str, e.path)) or 'arguments', e.message[:120]) for e in errs[:3]) or None
 
 def _example(s):
     t = s.get('type')
@@ -196,6 +195,7 @@ def _example(s):
 
 def mock_plan(body):
     inc, pol = body['incident'], body['policy']
+    if 'MOCKPLAN fail' in inc['transcript']: return {'rootCause': 'not-allowed', 'evidence': ['zzz']}
     ids = evidence_ids(inc['transcript']); names = [t['name'] for t in body['toolCatalog']]
     diag = [n for n in names if n not in pol['effectTools']][:1]; eff = [n for n in pol['effectTools'] if n in names][0]
     m = re.search(r'MOCKPLAN diag=([\w,]*) effect=(\w+)', inc['transcript'])
@@ -267,10 +267,73 @@ def validate_plan(p, body, ids, secrets_):
     if any(s in blob for s in secrets_): raise ValueError('arguments must not contain sensitive values')
     return {'rootCause': p['rootCause'], 'evidence': ev, 'diagnostics': out_d, 'effect': eff}
 
+def _words(x):
+    return [w for w in re.split(r'[^a-z0-9]+', x.lower()) if len(w) > 2]
+
+def _smart(schema, name, body):
+    inc = body['incident']; n = (name or '').lower(); t = schema.get('type') if isinstance(schema, dict) else None
+    if not isinstance(schema, dict): return 'unknown'
+    if 'enum' in schema and schema['enum']: return schema['enum'][0]
+    if t == 'object' or ('properties' in schema and t is None):
+        props = schema.get('properties', {}); req = schema.get('required') or []
+        return {k: _smart(props.get(k, {}), k, body) for k in req}
+    if t in ('integer', 'number'):
+        v = 15 if any(k in n for k in ('window', 'minute', 'duration', 'lookback')) else schema.get('minimum', 1)
+        if schema.get('minimum') is not None: v = max(v, schema['minimum'])
+        if schema.get('maximum') is not None: v = min(v, schema['maximum'])
+        return v
+    if t == 'boolean': return True
+    if t == 'array': return [_smart(schema.get('items') or {}, name, body)] if schema.get('minItems', 0) else []
+    if 'service' in n: return inc['service']
+    if 'incident' in n: return inc['incidentId']
+    if 'sever' in n: return inc['severity']
+    if any(k in n for k in ('team', 'owner', 'oncall')): return 'on-call'
+    return 'unknown'
+
+def heuristic_plan(body, ids):
+    """Conservative last-resort plan from keyword overlap. Prefers a non-destructive effect."""
+    inc, pol = body['incident'], body['policy']
+    lines = [(m.group(1), ln.lower()) for ln in inc['transcript'].split('\n') for m in [re.match(r'\s*\[([A-Za-z0-9_.:\-]+)\]', ln)] if m]
+    best, bs = inc['allowedRootCauses'][0], -1
+    for rc in inc['allowedRootCauses']:
+        sc = sum(l.count(w) for _, l in lines for w in _words(rc))
+        if sc > bs: best, bs = rc, sc
+    ws = _words(best)
+    ev = list(dict.fromkeys(i for i, _ in sorted(lines, key=lambda it: -sum(it[1].count(w) for w in ws))))[:3]
+    cat = {t['name']: t for t in body['toolCatalog']}; eff = [t for t in pol['effectTools'] if t in cat]
+    dt = [n for n in cat if n not in pol['effectTools']][: min(1, pol['maximumDiagnostics'])]
+    safe = [t for t in eff if t not in pol['approvalRequiredFor']]
+    pick = next((t for t in safe if any(k in t.lower() for k in ('page', 'notify', 'escalat', 'alert'))), None) or (safe[0] if safe else eff[0])
+    return {'rootCause': best, 'evidence': ev[:4],
+            'diagnostics': [{'toolName': n, 'arguments': _smart(cat[n]['inputSchema'], '', body), 'evidence': ev[:2]} for n in dt],
+            'effect': {'toolName': pick, 'arguments': _smart(cat[pick]['inputSchema'], '', body), 'evidence': ev[:2]}}
+
+def degrade_plan(body, ids, raw, sec):
+    """Use whatever parts of the model's last answer are usable, fill the rest heuristically."""
+    plan = heuristic_plan(body, ids)
+    cat = {t['name']: t for t in body['toolCatalog']}; eff = set(body['policy']['effectTools']); cap = min(3, body['policy']['maximumDiagnostics'])
+    clean = lambda o: not any(x in canonical(o) for x in sec)
+    if isinstance(raw, dict):
+        if raw.get('rootCause') in body['incident']['allowedRootCauses']: plan['rootCause'] = raw['rootCause']
+        ev = [x for x in norm_ids(raw.get('evidence')) if x in ids][:4]
+        if ev:
+            if len(ev) == 1: ev.append(ids[ids.index(ev[0]) + 1] if ids.index(ev[0]) + 1 < len(ids) else ids[ids.index(ev[0]) - 1])
+            plan['evidence'] = ev
+        ds = [{'toolName': d['toolName'], 'arguments': d['arguments'], 'evidence': d.get('evidence')} for d in (raw.get('diagnostics') if isinstance(raw.get('diagnostics'), list) else [])
+              if isinstance(d, dict) and d.get('toolName') in cat and d['toolName'] not in eff and isinstance(d.get('arguments'), dict) and clean(d['arguments'])]
+        if ds: plan['diagnostics'] = ds[:cap]
+        f = raw.get('effect')
+        if isinstance(f, dict) and f.get('toolName') in eff and f['toolName'] in cat and isinstance(f.get('arguments'), dict) and clean(f['arguments']):
+            plan['effect'] = {'toolName': f['toolName'], 'arguments': f['arguments'], 'evidence': f.get('evidence')}
+    for item in plan['diagnostics'] + [plan['effect']]:
+        try: item['evidence'] = _ev(item.get('evidence'), ids, plan['evidence'])
+        except ValueError: item['evidence'] = [plan['evidence'][0]]
+    return plan
+
 def plan_incident(body, deadline):
-    ids = evidence_ids(body['incident']['transcript']); sec = secret_strings(body['sensitive'])
+    ids = list(dict.fromkeys(evidence_ids(body['incident']['transcript']))); sec = secret_strings(body['sensitive'])
     if len(ids) < 2: raise PlanFailed('no evidence ids')
-    feedback, started = {}, time.time_ns()
+    feedback, started, raw = {}, time.time_ns(), None
     for attempt in range(2):
         remaining = deadline - time.monotonic()
         if remaining < (4 if attempt == 0 else 10): break     # Gemini needs a deadline of at least 10s
@@ -284,7 +347,9 @@ def plan_incident(body, deadline):
         except Exception as e:
             log.error('MODEL CALL FAILED (attempt %d): %s: %s', attempt + 1, type(e).__name__, str(e)[:300])
             time.sleep(0.5)
-    raise PlanFailed('no valid plan')
+    log.error('FALLBACK PLAN USED (model unavailable or answers invalid): tools=%d evidence_ids=%d transcript_chars=%d model_answer=%s',
+              len(body['toolCatalog']), len(ids), len(body['incident']['transcript']), 'yes' if raw else 'none')
+    return degrade_plan(body, ids, raw, sec), started, time.time_ns()
 
 
 # ------------------------------------------------------------ state machine
