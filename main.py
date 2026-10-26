@@ -1,4 +1,4 @@
-import os, json, hashlib, sqlite3, re, time, secrets, logging, threading, copy
+import os, json, hashlib, sqlite3, re, time, secrets, logging, threading, copy, difflib
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
@@ -228,8 +228,28 @@ def norm_ids(lst):
             if x and x not in out: out.append(x)
     return out
 
+def _key(x):
+    return re.sub(r'(?<=\D)0+(?=\d)', '', re.sub(r'[^a-z0-9]', '', x.lower()))
+
+def resolve_ids(lst, ids):
+    """Map the model's evidence ids onto real transcript ids: exact, then case/punctuation/zero-padding
+    insensitive, then a unique close match (one mis-copied character). Never invents an id."""
+    keys = {}
+    for i in ids: keys.setdefault(_key(i), []).append(i)
+    out, idset = [], set(ids)
+    for x in norm_ids(lst):
+        hit = x if x in idset else None
+        if not hit:
+            c = keys.get(_key(x))
+            if c and len(c) == 1: hit = c[0]
+        if not hit:
+            m = difflib.get_close_matches(x, ids, n=2, cutoff=0.8)
+            if len(m) == 1: hit = m[0]          # ambiguous near-matches are rejected, never guessed
+        if hit and hit not in out: out.append(hit)
+    return out
+
 def _ev(lst, ids, diag_ev):
-    out = [x for x in norm_ids(lst) if x in ids]
+    out = resolve_ids(lst, ids)
     if not out: raise ValueError('evidence ids must exist in the transcript, written exactly as in the square brackets (e.g. ev_012)')
     if not any(x in diag_ev for x in out): out.insert(0, diag_ev[0])
     return out[:4]
@@ -238,8 +258,8 @@ def validate_plan(p, body, ids, secrets_):
     if not isinstance(p, dict): raise ValueError('plan must be an object')
     inc, pol = body['incident'], body['policy']
     if p.get('rootCause') not in inc['allowedRootCauses']: raise ValueError('rootCause must be exactly one of allowedRootCauses')
-    ev = [x for x in norm_ids(p.get('evidence')) if x in ids]
-    if not ev: raise ValueError('diagnosis evidence: none of the ids exist in the transcript; use ids exactly as written in the square brackets (e.g. ev_012), without brackets')
+    ev = resolve_ids(p.get('evidence'), ids)
+    if not ev: raise ValueError('diagnosis evidence: none of %s exist in the transcript. Copy ids exactly as written inside the square brackets, for example %s' % (norm_ids(p.get('evidence'))[:3], ids[:3]))
     if len(ev) == 1:   # need 2-4: add the neighbouring line rather than waste a retry
         i = ids.index(ev[0]); ev.append(ids[i + 1] if i + 1 < len(ids) else ids[i - 1])
     ev = ev[:4]
@@ -315,7 +335,7 @@ def degrade_plan(body, ids, raw, sec):
     clean = lambda o: not any(x in canonical(o) for x in sec)
     if isinstance(raw, dict):
         if raw.get('rootCause') in body['incident']['allowedRootCauses']: plan['rootCause'] = raw['rootCause']
-        ev = [x for x in norm_ids(raw.get('evidence')) if x in ids][:4]
+        ev = resolve_ids(raw.get('evidence'), ids)[:4]
         if ev:
             if len(ev) == 1: ev.append(ids[ids.index(ev[0]) + 1] if ids.index(ev[0]) + 1 < len(ids) else ids[ids.index(ev[0]) - 1])
             plan['evidence'] = ev
