@@ -3,6 +3,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from dotenv import load_dotenv
+try:
+    from google import genai
+    from google.genai import types
+    import jsonschema
+except ImportError:   # mock/test machines without the packages
+    genai = types = jsonschema = None
 
 load_dotenv()
 log = logging.getLogger('incident')
@@ -169,7 +175,6 @@ class PlanFailed(Exception):
 
 def schema_errors(schema, args):
     try:
-        import jsonschema
         v = jsonschema.Draft202012Validator(schema)
         errs = sorted(v.iter_errors(args), key=lambda e: list(map(str, e.path)))
         return '; '.join('%s: %s' % ('/'.join(map(str, e.path)) or 'arguments', e.message[:120]) for e in errs[:3]) or None
@@ -204,8 +209,6 @@ def call_model(body, feedback, timeout):
     global MODEL_CALLS
     MODEL_CALLS += 1
     if MOCK: return mock_plan(body)
-    from google import genai
-    from google.genai import types
     inc, pol = body['incident'], body['policy']
     payload = {'incident': {k: inc[k] for k in ('title', 'service', 'severity', 'transcript', 'allowedRootCauses')},
                'toolCatalog': body['toolCatalog'],
@@ -480,10 +483,13 @@ def create_run(body, hdr_tp, hdr_ts, t0_ns, t0):
                 if row['request_hash'] != rh: return fail('RUN_CONFLICT', 409)
                 ev = c.x('SELECT response_json FROM events WHERE run_id=? AND ev_key=?', (rid, 'create')).fetchone()
                 return jr(ev['response_json'])
+        t_lookup = time.monotonic() - t0
         try:
             plan, ms, me = plan_incident(body, t0 + PLAN_BUDGET)
         except PlanFailed:
+            log.error('create FAILED: no valid plan after %.1fs', time.monotonic() - t0)
             return fail('PLAN_UNAVAILABLE', 503)          # nothing stored: the same request may be retried
+        t_plan = time.monotonic() - t0
         st, disp = build_state(body, plan, hdr_tp, hdr_ts, t0_ns, ms, me)
         text = canonical(waiting_view(st, disp, []))
         with Conn() as c:
@@ -493,6 +499,7 @@ def create_run(body, hdr_tp, hdr_ts, t0_ns, t0):
                 if row['request_hash'] != rh: return fail('RUN_CONFLICT', 409)
                 return jr(c.x('SELECT response_json FROM events WHERE run_id=? AND ev_key=?', (rid, 'create')).fetchone()['response_json'])
             c.x('INSERT INTO events(run_id,ev_key,req_hash,response_json) VALUES(?,?,?,?)', (rid, 'create', rh, text))
+        log.info('create timing: before_model=%.1fs model_done_at=%.1fs total=%.1fs', t_lookup, t_plan, time.monotonic() - t0)
         return jr(text)
 
 def post_receipt(run_id, body):
